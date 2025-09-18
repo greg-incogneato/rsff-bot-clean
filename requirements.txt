@@ -1,0 +1,8 @@
+discord.py>=2.3
+python-dotenv>=1.0
+google-api-python-client>=2.137
+google-auth>=2.35
+google-auth-httplib2>=0.2
+google-auth-oauthlib>=1.2
+aiohttp>=3.9
+rapidfuzz>=3.9
