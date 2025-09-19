@@ -70,12 +70,19 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 SHEET_ID = os.getenv("RSFF_SHEET_ID")
 RANGES = os.getenv("RSFF_RANGES").split(",")
 
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+intents = discord.Intents.none()     # start from nothing
+intents.message_content = True       # only what you need
+
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    help_command=None,
+    max_messages=100,                # default is 1000; reduce cache
+    chunk_guilds_at_startup=False,   # don’t prefetch members
+)
 
 SNAPSHOT = None
-@tasks.loop(minutes=15)
+@tasks.loop(minutes=30)
 async def autosync():
     global SNAPSHOT
     try:

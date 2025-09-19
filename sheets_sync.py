@@ -1,46 +1,59 @@
 # sheets_sync.py
-import os, json, hashlib, datetime, re
-from google.oauth2.service_account import Credentials
+import os
+import hashlib
+import datetime
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+# Scope we need: read-only access
+_SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+_SERVICE = None  # global singleton client
 
-def _now_et():
-    return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-4))).strftime("%Y-%m-%d %H:%M:%S ET")
 
-def _slug(s: str) -> str:
-    # lower, strip, collapse spaces, remove non-word chars
-    s = (s or "").strip().lower()
-    s = re.sub(r"\s+", " ", s)
-    s = s.replace("#","num").replace("?","").replace("/"," ").replace("\\"," ")
-    s = re.sub(r"[^a-z0-9 _-]", "", s)
-    return s.replace(" ", "_")
+def _get_service():
+    """Return a cached Google Sheets service client."""
+    global _SERVICE
+    if _SERVICE is None:
+        # Use service account JSON (either from file or temp file set in app.py shim)
+        creds = service_account.Credentials.from_service_account_file(
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"],
+            scopes=_SCOPES
+        )
+        _SERVICE = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return _SERVICE
 
-def _records_from_values(values):
-    if not values or len(values) < 2: return []
-    headers = [_slug(h) for h in values[0]]
-    out = []
-    for row in values[1:]:
-        if not any(str(c).strip() for c in row):  # skip empty rows
-            continue
-        rec = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
-        out.append(rec)
-    return out
 
 def pull_snapshot(sheet_id: str, ranges: list[str]):
-    creds = Credentials.from_service_account_file(
-        os.getenv("GOOGLE_APPLICATION_CREDENTIALS"), scopes=SCOPES
-    )
-    svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
-    resp = svc.spreadsheets().values().batchGet(
-        spreadsheetId=sheet_id, ranges=ranges
+    """
+    Fetch specified ranges from a Google Sheet and return a structured snapshot dict.
+    Example ranges: ["Salary2025!A1:F1000", "Rosters!A1:K1000", "Owners2025!A1:F1000", "Rules!A1:B995"]
+    """
+    service = _get_service()
+    result = service.spreadsheets().values().batchGet(
+        spreadsheetId=sheet_id,
+        ranges=ranges,
+        majorDimension="ROWS"
     ).execute()
 
     tabs = {}
-    for vr in resp.get("valueRanges", []):
-        rng = vr.get("range","")
-        tab = rng.split("!")[0]
-        tabs[tab] = _records_from_values(vr.get("values", []))
+    for resp in result.get("valueRanges", []):
+        rng = resp.get("range", "")
+        values = resp.get("values", [])
+        if not values:
+            continue
 
-    snap_hash = hashlib.sha256(json.dumps(tabs, sort_keys=True).encode()).hexdigest()[:10]
-    return {"tabs": tabs, "hash": snap_hash, "ts": _now_et()}
+        # Extract sheet name before "!"
+        tab_name = rng.split("!")[0]
+        header, *rows = values
+        # Normalize into list of dicts
+        dicts = []
+        for r in rows:
+            d = {header[i]: (r[i] if i < len(r) else "") for i in range(len(header))}
+            dicts.append(d)
+        tabs[tab_name] = dicts
+
+    # Snapshot metadata
+    h = hashlib.md5(str(tabs).encode()).hexdigest()[:8]
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    return {"hash": h, "ts": ts, "tabs": tabs}
