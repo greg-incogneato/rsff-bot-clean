@@ -6,3 +6,4 @@ google-auth-httplib2>=0.2
 google-auth-oauthlib>=1.2
 aiohttp>=3.9
 rapidfuzz>=3.9
+psutil>=5.9
