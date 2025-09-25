@@ -1,4 +1,4 @@
-APP_VERSION = "v0.1.0"
+APP_VERSION = "v0.1.1"
 import os, discord
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -9,11 +9,24 @@ from rapidfuzz import process, fuzz
 from sim.ops import simulate_add, simulate_drop  # top-level imports
 from sim.cap import cap_summary, cap_detail
 import base64, tempfile, os
+import os, resource, psutil
+
 
 # --- Team resolution helpers ---
 def _norm(s: str) -> str:
     return (s or "").strip()
 
+@bot.command(name="statusmem")
+async def statusmem_cmd(ctx):
+    rss_mb = psutil.Process(os.getpid()).memory_info().rss / (1024*1024)
+    tabs = SNAPSHOT.get("tabs", {})
+    lines = [
+        f"Memory RSS: `{rss_mb:,.0f} MB`",
+        f"Tabs: " + ", ".join([f"{k}:{len(v)}" for k,v in tabs.items()]),
+        f"Snapshot `{SNAPSHOT['hash']}` @ {SNAPSHOT['ts']}",
+    ]
+    await ctx.send("\n".join(lines))
+    
 def resolve_user_team(snapshot, member):
     tabs = snapshot.get("tabs", {})
     owners = tabs.get("Owners2025", [])
@@ -101,8 +114,14 @@ async def on_ready():
     await bot.change_presence(activity=discord.Game(name=f"RSFF {APP_VERSION} — !help"))
     global SNAPSHOT
     SNAPSHOT = pull_snapshot(SHEET_ID, RANGES)
+    # sync slash commands
+    try:
+        await bot.tree.sync()
+        print("✅ Slash commands synced")
+    except Exception as e:
+        print(f"Slash sync failed: {e}")
     autosync.start()
-    print(f"✅ Logged in as {bot.user} | Snapshot {SNAPSHOT['hash']} @ {SNAPSHOT['ts']}")    
+    print(f"✅ Logged in as {bot.user} | Snapshot {SNAPSHOT['hash']} @ {SNAPSHOT['ts']}")
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -118,9 +137,22 @@ async def version_cmd(ctx):
 @commands.has_guild_permissions(administrator=True)
 async def sync_cmd(ctx):
     global SNAPSHOT
+    before = {k: len(v) for k, v in (SNAPSHOT or {"tabs":{}}).get("tabs", {}).items()}
     SNAPSHOT = pull_snapshot(SHEET_ID, RANGES)
-    await ctx.send(f"🔄 Synced. Snapshot `{SNAPSHOT['hash']}` @ {SNAPSHOT['ts']}")
-
+    after = {k: len(v) for k, v in SNAPSHOT.get("tabs", {}).items()}
+    # diff summary
+    keys = sorted(set(before) | set(after))
+    diffs = []
+    for k in keys:
+        b, a = before.get(k, 0), after.get(k, 0)
+        mark = "↔️" if a == b else ("⬆️" if a > b else "⬇️")
+        diffs.append(f"{k}:{b}→{a} {mark}")
+    await ctx.send(
+        "🔄 Synced.\n"
+        f"Snapshot `{SNAPSHOT['hash']}` @ {SNAPSHOT['ts']}\n"
+        "Rows: " + ", ".join(diffs)
+    )
+    
 @sync_cmd.error
 async def sync_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
@@ -170,9 +202,8 @@ async def capdetail_cmd(ctx, *, team_name: str | None = None):
     except Exception as e:
         await ctx.send(f"❌ {e}")
 
-@bot.command(name="help")
-async def help_cmd(ctx):
-    lines = [
+def _help_lines():
+    return [
         "**RSFF Bot — Commands**",
         "`!cap [team]` — Cap used/remaining. Omit team to use your mapped team.",
         "`!capdetail [team]` — Top counted salaries + who got DP.",
@@ -182,7 +213,16 @@ async def help_cmd(ctx):
         "`!status` — Snapshot/time and row counts.",
         "`!sync` — Admin only: refresh from Google Sheet.",
     ]
-    await ctx.send("\n".join(lines))
+
+@bot.command(name="help")
+async def help_cmd(ctx):
+    await ctx.send("\n".join(_help_lines()))
+
+from discord import app_commands
+
+@bot.tree.command(name="help", description="Show RSFF Bot commands")
+async def slash_help(interaction: discord.Interaction):
+    await interaction.response.send_message("\n".join(_help_lines()), ephemeral=True)
 
 @bot.command(name="status")
 async def status_cmd(ctx):
