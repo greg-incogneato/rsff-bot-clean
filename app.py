@@ -1,12 +1,15 @@
-# app.py — RSFF Bot v0.1.1 (clean)
+# app.py — RSFF Bot v0.1.2 (clean)
 
-APP_VERSION = "v0.1.1"
+APP_VERSION = "v0.1.2"
 
 import os, base64, tempfile, logging, resource, psutil
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 from dotenv import load_dotenv
+from sim.team_summary import team_summary
+from sim.player_lookup import player_lookup
+from sim.ops import simulate_add, simulate_drop, simulate_whatif
 
 # ---- Load env FIRST
 load_dotenv()
@@ -128,18 +131,39 @@ async def slash_help(interaction: discord.Interaction):
 
 @bot.command(name="help")
 async def help_cmd(ctx):
-    await ctx.send("\n".join([
+    lines = [
         "**RSFF Bot — Commands**",
+        "",
+        "__Cap & Team__",
         "`!cap [team]` — Cap used/remaining. Omit team to use your mapped team.",
-        "`!capdetail [team]` — Top counted salaries + who got DP.",
-        "`!add <player>` — Sim add to your team (discount after week).",
-        "`!drop <player>` — Sim drop from your team (dead cap applies).",
-        "`!leaders` — Top 5 cap space remaining.",
-        "`!status` — Snapshot/time and row counts.",
-        "`!statusmem` — Process memory + tab counts.",
-        "`!sync` — Admin only: refresh from Google Sheet.",
-    ]))
-
+        "`!capdetail [team]` — Top counted salaries + DP/IR relief shown.",
+        "`!teamsum [team]` — Full team summary (net used, gross, DP, IR, players).",
+        "",
+        "__Players__",
+        "`!player <name>` — Player info: AAV, NFL team, bye, rostered-by, DP/IR, Sleeper ID.",
+        "",
+        "__Transactions (simulated)__",
+        "`!add <player>` — Sim add. Shows roster change and cap impact (before → after, Δ).",
+        "`!drop <player>` — Sim drop. Applies dead-cap from rules and shows cap impact.",
+        "`!whatif add <p1> [drop <p2>]` — Combined scenario with DP re-selection.",
+        "    e.g., `!whatif add aaron rodgers drop mahomes`",
+        "",
+        "__Leaders & Status__",
+        "`!leaders` — Top cap space remaining (Top 5).",
+        "`!status` — Snapshot hash/time and row counts.",
+        "`!version` — Bot version + snapshot.",
+        "",
+        "__Admin__",
+        "`!sync` — Admin only: refresh from Google Sheets.",
+        "",
+        "_Notes:_",
+        "• Team defaulting uses your Discord handle mapped in `Owners2025.discord user`.",
+        "• Adds don’t hard-block at roster max; you’ll see a warning to drop someone.",
+        "• Cap math follows RSFF rules: DP/IR relief and dead-cap on drops.",
+        f"_Snapshot {SNAPSHOT['hash']} @ {SNAPSHOT['ts']}_",
+    ]
+    await ctx.send("\n".join(lines))
+    
 # ---- Team resolution helpers + core commands
 def _norm(s: str) -> str:
     return (s or "").strip()
@@ -269,37 +293,215 @@ async def sync_error(ctx, error):
 async def drop_cmd(ctx, *, player: str):
     team = resolve_user_team(SNAPSHOT, ctx.author)
     if not team:
-        return await ctx.send("❓ I couldn't map you to a team. Add your handle to Owners2025.`discord user`, or run `!cap <team>` once.")
+        return await ctx.send("❓ I couldn't map you to a team. Add your handle to Owners2025.discord user, or run `!cap <team>` once.")
     res = simulate_drop(SNAPSHOT, team, player)
     if res["status"] == "INVALID":
         return await ctx.send(f"❌ {res['reason']}")
+
+    ts = team_summary(SNAPSHOT, team)
+    used_before = float(ts["cap_used"])
+    cap_limit   = float(ts["cap_limit"])
+    rem_before  = cap_limit - used_before
+
+    base = float(res["salary_base"])
+    dead = float(res["dead_cap"])
+    was_dp = bool(res.get("was_dp", False))
+    was_ir = bool(res.get("was_ir", False))
+
+    if was_dp or was_ir:
+        used_after = used_before + dead
+    else:
+        used_after = used_before - base + dead
+
+    rem_after  = cap_limit - used_after
+    delta_used = used_after - used_before
+    delta_rem  = rem_after - rem_before
+
     lines = [
         f"**Drop {res['player']}** for **{res['team']}**",
-        f"Dead Cap: `${res['dead_cap']:,.0f}`",
+        f"Dead Cap (from rules): `${dead:,.0f}` on base `${base:,.0f}`",
         f"Roster: {res['roster_before']} → {res['roster_after']} (max {14})",
+        "",
+        f"**Cap Used:** `${used_before:,.0f}` → `${used_after:,.0f}`  _(Δ `${delta_used:,.0f}`)_",
+        f"**Cap Remaining:** `${rem_before:,.0f}` → `${rem_after:,.0f}`  _(Δ `${delta_rem:,.0f}`)_",
+        f"_Snapshot {SNAPSHOT['hash']} @ {SNAPSHOT['ts']}_",
     ]
-    for v in res.get("violations", []):
-        lines.append(f"⚠️ {v['code']}: {v['detail']}")
-    lines.append(f"_Snapshot {SNAPSHOT['hash']} @ {SNAPSHOT['ts']}_")
     await ctx.send("\n".join(lines))
 
 @bot.command(name="add")
 async def add_cmd(ctx, *, player: str):
     team = resolve_user_team(SNAPSHOT, ctx.author)
     if not team:
-        return await ctx.send("❓ I couldn't map you to a team. Add your handle to Owners2025.`discord user`, or run `!cap <team>` once.")
+        return await ctx.send("❓ I couldn't map you to a team. Add your handle to Owners2025.discord user, or run `!cap <team>` once.")
     res = simulate_add(SNAPSHOT, team, player)
     if res["status"] == "INVALID":
         return await ctx.send(f"❌ {res['reason']}")
-    disc = f" (discounted {int(res['discount_applied']*100)}%)" if res.get("discount_applied", 0) > 0 else ""
+
+    # Baseline from snapshot
+    ts = team_summary(SNAPSHOT, team)
+    used_before = float(ts["cap_used"])
+    cap_limit   = float(ts["cap_limit"])
+    rem_before  = cap_limit - used_before
+
+    used_after = used_before + float(res["salary_effective"])
+    rem_after  = cap_limit - used_after
+    delta_used = used_after - used_before
+    delta_rem  = rem_after - rem_before
+
     lines = [
         f"**Add {res['player']}** to **{res['team']}**",
-        f"Salary: `${res['salary_effective']:,.0f}`{disc} (base `${res['salary_base']:,.0f}`)",
+        f"Availability: {res.get('availability','FA')}",
+        f"Salary: `${res['salary_effective']:,.0f}` (base `${res['salary_base']:,.0f}`)",
         f"Roster: {res['roster_before']} → {res['roster_after']} (max {14})",
+        "",
+        f"**Cap Used:** `${used_before:,.0f}` → `${used_after:,.0f}`  _(Δ `${delta_used:,.0f}`)_",
+        f"**Cap Remaining:** `${rem_before:,.0f}` → `${rem_after:,.0f}`  _(Δ `${delta_rem:,.0f}`)_",
     ]
     for v in res.get("violations", []):
         lines.append(f"⚠️ {v['code']}: {v['detail']}")
     lines.append(f"_Snapshot {SNAPSHOT['hash']} @ {SNAPSHOT['ts']}_")
+    await ctx.send("\n".join(lines))
+
+@bot.command(name="teamsum")
+async def teamsum_cmd(ctx, *, team_name: str | None = None):
+    query = team_name or resolve_user_team(SNAPSHOT, ctx.author)
+    if not query:
+        return await ctx.send("❓ Couldn’t map you to a team. Try `!teamsum <team>`.")
+
+    res = team_summary(SNAPSHOT, query)
+
+    lines = [
+        f"**Team: {res['team_name']}**",
+        f"Cap Used (net): `${res['cap_used']:,.0f}` / `${res['cap_limit']:,.0f}`",
+        f"Breakdown: Gross `${res['gross_cap']:,.0f}` – DP `${res['dp_relief']:,.0f}` – IR `${res['ir_relief']:,.0f}`",
+        f"Cap Remaining: `${res['cap_remaining']:,.0f}`",
+        f"Players Counted: {res['players_counted']} / 14",
+        f"_Snapshot {SNAPSHOT['hash']} @ {SNAPSHOT['ts']}_",
+        "",
+        "**Active Roster:**",
+    ]
+
+    for p in res["active"]:
+        dp_tag = " (DP)" if p["dp"] else ""
+        lines.append(f"{p['pos']:<4} {p['name']} — `${p['salary']:,.0f}`{dp_tag}")
+
+    if res["ir"]:
+        lines += [
+            "",
+            f"**Injured Reserve ({len(res['ir'])} players — IR Relief: -${res['ir_relief']:,.0f})**"
+        ]
+        for p in res["ir"]:
+            lines.append(f"{p['pos']:<4} {p['name']} — `${p['salary']:,.0f}` (IR)")
+
+    await ctx.send("\n".join(lines))
+
+@bot.command(name="player")
+async def player_cmd(ctx, *, name: str):
+    res = player_lookup(SNAPSHOT, name)
+    if not res:
+        return await ctx.send(f"❌ No match for `{name}`. Try more letters (e.g., `!player patrick maho`).")
+
+    status = "Free Agent" if res["status"] == "FA" else f"Rostered by **{res['rostered_by']}**"
+    flags = []
+    if res.get("dp"): flags.append("DP")
+    if res.get("on_ir"): flags.append("IR")
+    flag_txt = f" ({', '.join(flags)})" if flags else ""
+
+    lines = [
+        f"**{res['name']}** — {res.get('pos') or '?'} {res.get('nfl') or ''}{flag_txt}",
+        f"AAV: `${res['aav']:,.0f}` | Status: {status}",
+    ]
+    if res.get("player_id"):
+        lines.append(f"Sleeper ID: `{res['player_id']}`")
+    if res.get("bye"):
+        lines.append(f"Bye: {res['bye']}")
+    lines.append(f"_Search match: {res.get('match_score', 0)}/100 · Snapshot {SNAPSHOT['hash']} @ {SNAPSHOT['ts']}_")
+    await ctx.send("\n".join(lines))
+
+@bot.command(name="whatif")
+async def whatif_cmd(ctx, *, args: str):
+    """
+    Usage examples:
+      !whatif add aaron rodgers
+      !whatif drop mahomes
+      !whatif add aaron rodgers drop mahomes
+    """
+    team = resolve_user_team(SNAPSHOT, ctx.author)
+    if not team:
+        return await ctx.send("❓ I couldn't map you to a team. Add your handle to Owners2025.discord user, or run `!cap <team>` once.")
+
+    # very light parser
+    tokens = args.split()
+    add_query, drop_query = None, None
+    i = 0
+    while i < len(tokens):
+        t = tokens[i].lower()
+        if t == "add":
+            i += 1
+            start = i
+            while i < len(tokens) and tokens[i].lower() not in {"add", "drop"}:
+                i += 1
+            add_query = " ".join(tokens[start:i]).strip()
+            continue
+        if t == "drop":
+            i += 1
+            start = i
+            while i < len(tokens) and tokens[i].lower() not in {"add", "drop"}:
+                i += 1
+            drop_query = " ".join(tokens[start:i]).strip()
+            continue
+        i += 1
+
+    if not add_query and not drop_query:
+        return await ctx.send("Try: `!whatif add <player>` or `!whatif drop <player>` or `!whatif add <p1> drop <p2>`")
+
+    res = simulate_whatif(SNAPSHOT, team, add_query, drop_query)
+    if res["status"] == "INVALID":
+        return await ctx.send(f"❌ {res['reason']}")
+
+    ts = team_summary(SNAPSHOT, team)
+    used_before = float(ts["cap_used"])
+    cap_limit   = float(ts["cap_limit"])
+    rem_before  = cap_limit - used_before
+
+    used_after = used_before + float(res["used_delta"])
+    rem_after  = cap_limit - used_after
+    delta_used = used_after - used_before
+    delta_rem  = rem_after - rem_before
+
+    lines = [f"**What-if for {team}**"]
+    if add_query:
+        ar = res.get("add_result")
+        if ar and ar.get("status") == "OK":
+            lines += [
+                f"• Add **{ar['player']}** → Salary `${ar['salary_effective']:,.0f}` (base `${ar['salary_base']:,.0f}`)",
+            ]
+        elif ar:
+            lines += [f"• Add {add_query}: ❌ {ar.get('reason')}"]
+
+    if drop_query:
+        dr = res.get("drop_result")
+        if dr and dr.get("status") == "OK":
+            lines += [
+                f"• Drop **{dr['player']}** → Dead Cap `${dr['dead_cap']:,.0f}` on base `${dr['salary_base']:,.0f}`",
+            ]
+        elif dr:
+            lines += [f"• Drop {drop_query}: ❌ {dr.get('reason')}"]
+
+    if res.get("violations"):
+        for v in res["violations"]:
+            lines.append(f"⚠️ {v['code']}: {v['detail']}")
+
+    if res.get("dp_before") is not None and res.get("dp_after") is not None:
+        if abs(res["dp_after"] - res["dp_before"]) > 1e-6:
+            lines.append(f"_DP re-selected: `${res['dp_before']:,.0f}` → `${res['dp_after']:,.0f}`_")
+
+    lines += [
+        "",
+        f"**Cap Used:** `${used_before:,.0f}` → `${used_after:,.0f}`  _(Δ `${delta_used:,.0f}`)_",
+        f"**Cap Remaining:** `${rem_before:,.0f}` → `${rem_after:,.0f}`  _(Δ `${delta_rem:,.0f}`)_",
+        f"_Snapshot {SNAPSHOT['hash']} @ {SNAPSHOT['ts']}_",
+    ]
     await ctx.send("\n".join(lines))
 
 if __name__ == "__main__":
